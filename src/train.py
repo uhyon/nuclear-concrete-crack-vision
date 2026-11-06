@@ -14,12 +14,19 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import segmentation_models_pytorch as smp
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, get_worker_info
 
 from src.dataset import CrackDataset, find_pairs, split_pairs
 from src.metrics import batch_stats, summarize
+
+
+def seed_worker(_worker_id: int) -> None:
+    """워커마다(그리고 epoch마다) 다른 난수열을 쓰게 해 증강이 겹치지 않도록 한다."""
+    info = get_worker_info()
+    info.dataset.rng = np.random.default_rng(torch.initial_seed() % 2**32)
 
 
 def main() -> None:
@@ -33,6 +40,7 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--limit", type=int, default=None, help="사용할 이미지 수 상한(무료 Colab용)")
     p.add_argument("--encoder", default="resnet34")
+    p.add_argument("--encoder-weights", default="imagenet", help='사전학습 가중치. "none"이면 처음부터 학습')
     p.add_argument("--condition-aug", action="store_true")
     p.add_argument("--workers", type=int, default=2)
     a = p.parse_args()
@@ -48,15 +56,17 @@ def main() -> None:
     print(f"train {len(train_pairs)} / val {len(val_pairs)}")
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = smp.Unet(a.encoder, encoder_weights="imagenet", in_channels=3, classes=1).to(dev)
+    weights = None if a.encoder_weights.lower() == "none" else a.encoder_weights
+    model = smp.Unet(a.encoder, encoder_weights=weights, in_channels=3, classes=1).to(dev)
     dice = smp.losses.DiceLoss("binary")
     bce = torch.nn.BCEWithLogitsLoss()
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=dev == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=dev == "cuda")
 
     tl = DataLoader(CrackDataset(train_pairs, a.size, train=True, condition_aug=a.condition_aug),
-                    batch_size=a.batch, shuffle=True, num_workers=a.workers, drop_last=True)
+                    batch_size=a.batch, shuffle=True, num_workers=a.workers, drop_last=True,
+                    worker_init_fn=seed_worker)
     vl = DataLoader(CrackDataset(val_pairs, a.size), batch_size=a.batch, num_workers=a.workers)
 
     best, history = -1.0, []
